@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PSFA Swim Club Register</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Socket.IO client -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+    let maxAttendees = {{ max_attendees }};
+    let currentData = null;
+    let selectedDate = "{{ selected_date }}";
+    let supervisors = {{ supervisors }};
+    let socket = io();
+
+    socket.on('connect', function() {
+        // Connected
+    });
+    socket.on('refresh', function(data) {
+        if (data.date === selectedDate) {
+            refreshTable();
+        }
+    });
+
+    function ensureDatePicker() {
+        const picker = document.getElementById("datePicker");
+        if (!picker.value) {
+            const today = new Date();
+            const iso = today.toISOString().slice(0,10);
+            picker.value = iso;
+            selectedDate = iso;
+        } else {
+            selectedDate = picker.value;
+        }
+    }
+
+    function safeId(name) {
+        return name.replace(/[^a-zA-Z0-9]/g, "_");
+    }
+
+    function filterNames() {
+        var input = document.getElementById("searchBox");
+        var filter = input.value.toLowerCase();
+        var tbody = document.getElementById("attendanceTbody");
+        var trs = tbody.getElementsByTagName("tr");
+        for (var i = 0; i < trs.length; i++) {
+            var td = trs[i].getElementsByTagName("td");
+            if (td && td.length > 0) {
+                var nameText = td[0].innerText || td[0].textContent;
+                var name = nameText.trim();
+                trs[i].style.display = name.toLowerCase().includes(filter) ? "" : "none";
+            }
+        }
+        // Hide waitlist if search box contains text
+        var exclusionList = document.getElementById("exclusionList");
+        if (input.value.trim() !== "") {
+            exclusionList.style.display = "none";
+        } else if (exclusionList.dataset.shouldShow === "true") {
+            exclusionList.style.display = "block";
+        }
+    }
+
+    function clearSearch() {
+        var input = document.getElementById("searchBox");
+        input.value = "";
+        filterNames();
+    }
+
+    async function updateAttendance(name, present, excluded, admitted) {
+        if (!present) {
+            excluded = 0;
+            admitted = 0;
+        }
+        await fetch("/update", {
+            method: "POST",
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name, present, excluded, admitted, date: selectedDate})
+        });
+        // No need to refreshTable here - server will notify via socket
+    }
+
+    async function updateSupervisors(count) {
+        supervisors = count;
+        maxAttendees = (count == 2) ? 17 : 21;
+        document.getElementById("maxLabel").textContent = maxAttendees;
+        await fetch("/update_supervisors", {
+            method: "POST",
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({date: selectedDate, supervisors: count})
+        });
+        // No need to refreshTable here - server will notify via socket
+    }
+
+    function setSupervisorRadios(count) {
+        document.getElementById("supervisors2").checked = (count == 2);
+        document.getElementById("supervisors3").checked = (count == 3);
+        maxAttendees = (count == 2) ? 17 : 21;
+        document.getElementById("maxLabel").textContent = maxAttendees;
+    }
+
+    function supervisorToggleChanged() {
+        let count = document.getElementById("supervisors2").checked ? 2 : 3;
+        updateSupervisors(count);
+    }
+
+    function dateChanged() {
+        selectedDate = document.getElementById("datePicker").value;
+        refreshTable();
+    }
+
+    async function refreshTable() {
+        ensureDatePicker();
+        const res = await fetch("/fetch?date=" + encodeURIComponent(selectedDate));
+        const data = await res.json();
+        currentData = data;
+        setSupervisorRadios(data.supervisors);
+        renderTable(data.attendance, data.attendance_counts, data.exclusion_counts);
+        updateCount();
+        filterNames();
+    }
+
+    // --- Risk ranking with group boundary detection for coloring ---
+    function getRiskRanking(attendance, attendance_counts, exclusion_counts) {
+        const allStudents = [];
+        for (const name in attendance) {
+            const count = attendance_counts[name] || 0;
+            const exclCount = exclusion_counts[name] || 0;
+            let ratio;
+            if (count === 0) {
+                ratio = 1.0;
+            } else {
+                ratio = exclCount / count;
+            }
+            allStudents.push({
+                name: name,
+                ratio: ratio,
+                attendanceCount: count,
+                exclusionCount: exclCount
+            });
+        }
+        allStudents.sort((a, b) => {
+            if (a.ratio !== b.ratio) return b.ratio - a.ratio;
+            return a.attendanceCount - b.attendanceCount;
+        });
+
+        const rankedStudents = [];
+        let currentRatio = null, currentAtt = null;
+        let currentGroup = [];
+        for (let i = 0; i < allStudents.length; i++) {
+            const student = allStudents[i];
+            if (student.ratio !== currentRatio || student.attendanceCount !== currentAtt) {
+                if (currentGroup.length > 0) {
+                    const indices = currentGroup.map(s => s.index);
+                    const groupMin = Math.min(...indices);
+                    const groupMax = Math.max(...indices);
+                    const meanRank = indices.reduce((sum, idx) => sum + idx, 0) / indices.length;
+                    currentGroup.forEach(s => {
+                        s.groupMin = groupMin;
+                        s.groupMax = groupMax;
+                        s.meanRank = meanRank;
+                    });
+                    rankedStudents.push(...currentGroup);
+                }
+                currentRatio = student.ratio;
+                currentAtt = student.attendanceCount;
+                currentGroup = [{...student, index: i + 1}];
+            } else {
+                currentGroup.push({...student, index: i + 1});
+            }
+        }
+        if (currentGroup.length > 0) {
+            const indices = currentGroup.map(s => s.index);
+            const groupMin = Math.min(...indices);
+            const groupMax = Math.max(...indices);
+            const meanRank = indices.reduce((sum, idx) => sum + idx, 0) / indices.length;
+            currentGroup.forEach(s => {
+                s.groupMin = groupMin;
+                s.groupMax = groupMax;
+                s.meanRank = meanRank;
+            });
+            rankedStudents.push(...currentGroup);
+        }
+        const rankMap = new Map();
+        rankedStudents.forEach(student => {
+            rankMap.set(student.name, {
+                meanRank: student.meanRank,
+                groupMin: student.groupMin,
+                groupMax: student.groupMax
+            });
+        });
+        return { rankedStudents, rankMap };
+    }
+
+    function getRiskColor(positionInfo, totalStudents, maxAllowed) {
+        if (positionInfo.groupMin <= maxAllowed && positionInfo.groupMax > maxAllowed) {
+            return "#7bc47f";
+        }
+        if (positionInfo.meanRank <= maxAllowed) {
+            return "#1a9850";
+        } else {
+            const normalized = (positionInfo.meanRank - maxAllowed) / (totalStudents - maxAllowed);
+            const yellow = [255, 255, 191];
+            const red = [215, 48, 39];
+            const r = Math.round(yellow[0] + (red[0] - yellow[0]) * normalized);
+            const g = Math.round(yellow[1] + (red[1] - yellow[1]) * normalized);
+            const b = Math.round(yellow[2] + (red[2] - yellow[2]) * normalized);
+            return `rgb(${r},${g},${b})`;
+        }
+    }
+
+    function renderTable(attendance, attendance_counts, exclusion_counts) {
+        const tbody = document.getElementById("attendanceTbody");
+        tbody.innerHTML = "";
+
+        const { rankedStudents, rankMap } = getRiskRanking(attendance, attendance_counts, exclusion_counts);
+        const totalStudents = rankedStudents.length;
+
+        // Use Object.keys(attendance) so all students are shown
+        const displayList = Object.keys(attendance).map(name => ({
+            name,
+            present: attendance[name].present,
+            excluded: attendance[name].excluded,
+            admitted: attendance[name].admitted,
+            attendanceCount: attendance_counts[name] || 0,
+            exclusionCount: exclusion_counts[name] || 0
+        }));
+
+        displayList.sort((a, b) => {
+            if (a.present !== b.present) return a.present ? -1 : 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        displayList.forEach(student => {
+            const {name, present, excluded, admitted, attendanceCount, exclusionCount} = student;
+            const row = document.createElement("tr");
+            row.style.borderBottom = "1px solid #ddd";
+            row.style.display = "";
+
+            const tdName = document.createElement("td");
+            tdName.style.padding = "10px";
+            const colorBox = document.createElement("span");
+            colorBox.className = "risk-color-box";
+
+            const positionInfo = rankMap.get(name) || {
+                meanRank: totalStudents + 1,
+                groupMin: totalStudents + 1,
+                groupMax: totalStudents + 1
+            };
+            colorBox.style.backgroundColor = getRiskColor(positionInfo, totalStudents, maxAttendees);
+
+            tdName.appendChild(colorBox);
+            const nameSpan = document.createElement("span");
+            nameSpan.textContent = " " + name;
+            tdName.appendChild(nameSpan);
+            row.appendChild(tdName);
+
+            const tdCount = document.createElement("td");
+            tdCount.className = "att-col";
+            tdCount.style.padding = "10px";
+            tdCount.textContent = attendanceCount;
+            row.appendChild(tdCount);
+
+            const tdExclCount = document.createElement("td");
+            tdExclCount.className = "excl-col";
+            tdExclCount.style.padding = "10px";
+            tdExclCount.textContent = exclusionCount;
+            row.appendChild(tdExclCount);
+
+            const tdPresent = document.createElement("td");
+            tdPresent.style.padding = "10px";
+            const cbPresent = document.createElement("input");
+            cbPresent.type = "checkbox";
+            cbPresent.name = name;
+            cbPresent.checked = present;
+            cbPresent.onchange = function() {
+                if (document.getElementById('searchBox').value.trim() !== '') {
+                    clearSearch();
+                }
+                updateAttendance(
+                    name,
+                    cbPresent.checked ? 1 : 0,
+                    document.getElementById("excluded_" + name).checked ? 1 : 0,
+                    document.getElementById("admitted_" + name).checked ? 1 : 0
+                );
+            };
+            tdPresent.appendChild(cbPresent);
+            row.appendChild(tdPresent);
+
+            const tdExcluded = document.createElement("td");
+            tdExcluded.style.padding = "10px";
+            const cbExcluded = document.createElement("input");
+            cbExcluded.type = "checkbox";
+            cbExcluded.name = "excluded_" + name;
+            cbExcluded.id = "excluded_" + name;
+            cbExcluded.checked = excluded;
+            cbExcluded.disabled = !present;
+            cbExcluded.onchange = function() {
+                if (document.getElementById('searchBox').value.trim() !== '') {
+                    clearSearch();
+                }
+                updateAttendance(
+                    name,
+                    cbPresent.checked ? 1 : 0,
+                    cbExcluded.checked ? 1 : 0,
+                    document.getElementById("admitted_" + name).checked ? 1 : 0
+                );
+            };
+            tdExcluded.appendChild(cbExcluded);
+            row.appendChild(tdExcluded);
+
+            const tdAdmitted = document.createElement("td");
+            tdAdmitted.style.padding = "10px";
+            const cbAdmitted = document.createElement("input");
+            cbAdmitted.type = "checkbox";
+            cbAdmitted.name = "admitted_" + name;
+            cbAdmitted.id = "admitted_" + name;
+            cbAdmitted.checked = admitted;
+            cbAdmitted.disabled = !present;
+            cbAdmitted.onchange = function() {
+                if (document.getElementById('searchBox').value.trim() !== '') {
+                    clearSearch();
+                }
+                updateAttendance(
+                    name,
+                    cbPresent.checked ? 1 : 0,
+                    cbExcluded.checked ? 1 : 0,
+                    cbAdmitted.checked ? 1 : 0
+                );
+            };
+            tdAdmitted.appendChild(cbAdmitted);
+            row.appendChild(tdAdmitted);
+
+            tbody.appendChild(row);
+        });
+    }
+
+    function updateCount() {
+        var checkboxes = document.querySelectorAll("#attendanceTable input[type='checkbox'][name]:not([name^='excluded_']):not([name^='admitted_'])");
+        var presentCount = 0;
+        var excludedCount = 0;
+        checkboxes.forEach(function(cb) {
+            var name = cb.name;
+            var isChecked = cb.checked;
+            var isExcluded = document.getElementById("excluded_" + name).checked;
+            if (isChecked) {
+                if (isExcluded) {
+                    excludedCount++;
+                } else {
+                    presentCount++;
+                }
+            }
+        });
+        document.getElementById("currentCount").textContent = presentCount;
+        document.getElementById("maxLabel").textContent = maxAttendees;
+
+        var totalPresent = presentCount + excludedCount;
+        var needToExclude = Math.max(totalPresent - maxAttendees, 0);
+        suggestExclusions(needToExclude, true);
+
+        if (maxAttendees > 0 && totalPresent > maxAttendees) {
+            document.getElementById("currentCount").style.color = "red";
+        } else {
+            document.getElementById("currentCount").style.color = "";
+        }
+    }
+
+    function suggestExclusions(needToExclude, alwaysShow) {
+        if (!currentData) return;
+        var attendance = currentData.attendance;
+        var attendance_counts = currentData.attendance_counts;
+        var exclusion_counts = currentData.exclusion_counts;
+
+        const { rankedStudents, rankMap } = getRiskRanking(attendance, attendance_counts, exclusion_counts);
+
+        const suggestionOrder = rankedStudents.slice().reverse();
+
+        let nonExcludedAttendees = suggestionOrder
+            .filter(a => !attendance[a.name].excluded && attendance[a.name].present)
+            .map(a => ({
+                ...a,
+                attendanceCount: attendance_counts[a.name] || 0,
+                exclusionCount: exclusion_counts[a.name] || 0
+            }));
+        let excludedAttendees = suggestionOrder
+            .filter(a => attendance[a.name].excluded)
+            .map(a => ({
+                ...a,
+                attendanceCount: attendance_counts[a.name] || 0,
+                exclusionCount: exclusion_counts[a.name] || 0
+            }));
+
+        var toExclude = excludedAttendees.map(a => a);
+        var needMore = needToExclude - toExclude.length;
+
+        if (needMore > 0) {
+            let toExcludeFromNonExcluded = [];
+            if (nonExcludedAttendees.length > 0) {
+                toExcludeFromNonExcluded = nonExcludedAttendees.slice(0, needMore);
+                if (toExcludeFromNonExcluded.length > 0) {
+                    const lastIndex = toExcludeFromNonExcluded.length - 1;
+                    const lastStudent = toExcludeFromNonExcluded[lastIndex];
+                    const tiedGroup = nonExcludedAttendees.filter(s =>
+                        s.ratio === lastStudent.ratio &&
+                        s.attendanceCount === lastStudent.attendanceCount
+                    );
+                    if (tiedGroup.length > 1) {
+                        const firstTiedIndex = nonExcludedAttendees.findIndex(s =>
+                            s.ratio === lastStudent.ratio &&
+                            s.attendanceCount === lastStudent.attendanceCount
+                        );
+                        toExcludeFromNonExcluded = nonExcludedAttendees.slice(0, firstTiedIndex + tiedGroup.length);
+                    }
+                }
+            }
+            toExclude = toExclude.concat(toExcludeFromNonExcluded);
+        }
+
+        if (needToExclude <= 0 && alwaysShow && excludedAttendees.length > 0) {
+            toExclude = excludedAttendees.map(a => a);
+        }
+
+        var container = document.getElementById("exclusionList");
+        if (toExclude.length > 0) {
+            container.innerHTML = "<h3>Current/Proposed Waitlist:</h3>";
+            toExclude.forEach(att => {
+                const positionInfo = rankMap.get(att.name);
+                const color = getRiskColor(positionInfo, rankedStudents.length, maxAttendees);
+
+                var item = document.createElement("div");
+                item.className = "exclusion-item";
+                var colorBox = document.createElement("span");
+                colorBox.className = "risk-color-box";
+                colorBox.style.backgroundColor = color;
+                item.appendChild(colorBox);
+
+                var cb = document.createElement("input");
+                cb.type = "checkbox";
+                cb.name = "excluded_" + att.name;
+                cb.id = "excluded_" + att.name + "_suggestion";
+                cb.checked = document.getElementById("excluded_" + att.name) && document.getElementById("excluded_" + att.name).checked;
+                cb.disabled = !attendance[att.name].present;
+                cb.onclick = function() {
+                    if (attendance[att.name].present) {
+                        document.getElementById("excluded_" + att.name).click();
+                        updateAttendance(
+                            att.name,
+                            document.querySelector("#attendanceTable input[type='checkbox'][name='" + att.name + "']").checked ? 1 : 0,
+                            cb.checked ? 1 : 0,
+                            document.getElementById("admitted_" + att.name).checked ? 1 : 0
+                        );
+                    }
+                };
+
+                var label = document.createElement("label");
+                label.htmlFor = "excluded_" + att.name + "_suggestion";
+                label.textContent = " " + att.name + " (" + att.attendanceCount + " att, " + att.exclusionCount + " wait, ratio: " + att.ratio.toFixed(2) + ")";
+                if (!attendance[att.name].present) {
+                    label.style.color = "#888";
+                    label.textContent += " [not present today]";
+                }
+
+                item.appendChild(cb);
+                item.appendChild(label);
+                container.appendChild(item);
+            });
+            container.style.display = "block";
+            container.dataset.shouldShow = "true";
+            if (document.getElementById("searchBox").value.trim() !== "") {
+                container.style.display = "none";
+            }
+        } else {
+            container.style.display = "none";
+            container.dataset.shouldShow = "false";
+        }
+    }
+
+    window.onload = function() {
+        ensureDatePicker();
+        document.getElementById("datePicker").value = selectedDate;
+        document.getElementById("supervisors2").addEventListener('change', supervisorToggleChanged);
+        document.getElementById("supervisors3").addEventListener('change', supervisorToggleChanged);
+        document.getElementById("searchBox").addEventListener('input', filterNames);
+        document.getElementById("cancelBtn").addEventListener('click', clearSearch);
+        document.getElementById("datePicker").addEventListener('change', dateChanged);
+        refreshTable();
+    }
+    </script>
+    <style>
+        html, body {
+            font-family: Arial, sans-serif;
+            font-size: 18px;
+            margin: 0;
+            padding: 0;
+            background: #f7f7f7;
+        }
+        body {
+            padding: 0 0 60px 0;
+        }
+        h1 {
+            font-size: 1.4em;
+            margin: 16px 0 8px 0;
+            text-align: center;
+        }
+        #main-container {
+            max-width: 700px;
+            margin: 0 auto;
+            background: #fff;
+            box-sizing: border-box;
+        }
+        #controls {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            align-items: center;
+            justify-content: center;
+            background: #fff;
+            padding: 10px 0 5px 0;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            border-bottom: 1px solid #eee;
+            width: 100%;
+        }
+        #controls label, #controls input, #controls button {
+            font-size: 1em;
+        }
+        #dateRow, #searchRow, #supRow, #tallyRow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 4px;
+            flex-wrap: wrap;
+            width: 100%;
+        }
+        #dateRow label {
+            margin-right: 8px;
+        }
+        #datePicker {
+            font-size: 1.2em;
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            min-width: 170px;
+            max-width: 220px;
+        }
+        #searchBox {
+            font-size: 1em;
+            padding: 6px 10px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            min-width: 120px;
+            max-width: 180px;
+        }
+        #cancelBtn {
+            font-size: 1em;
+            padding: 6px 14px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            background: #eee;
+            margin-left: 4px;
+        }
+        .supervisor-toggle {
+            margin: 0 5px 0 0;
+            font-size: 1em;
+        }
+        #supLabel {
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        #runningTotal {
+            font-size: 2em;
+            font-weight: bold;
+            text-align: center;
+            margin: 10px 0 0 0;
+            display: block;
+        }
+        #attendanceTable {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            margin-top: 10px;
+            font-size: 1em;
+        }
+        #attendanceTable thead {
+            background: #f2f2f2;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }
+        #attendanceTable th, #attendanceTable td {
+            padding: 12px 8px;
+            min-width: 60px;
+            text-align: left;
+        }
+        #attendanceTable tr {
+            height: 48px;
+        }
+        .risk-color-box {
+            display: inline-block;
+            width: 22px;
+            height: 22px;
+            border-radius: 5px;
+            margin-right: 7px;
+            vertical-align: middle;
+            border: 1px solid #999;
+        }
+        input[type="checkbox"] {
+            width: 1.4em;
+            height: 1.4em;
+            accent-color: #1a9850;
+        }
+        #exclusionList {
+            margin-top: 16px;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background-color: #f9f9f9;
+            font-size: 1em;
+        }
+        .exclusion-item {
+            margin: 8px 0;
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+        }
+        .exclusion-item label {
+            margin-left: 10px;
+            font-size: 1em;
+            flex: 1;
+        }
+        @media (max-width: 900px) {
+            #main-container {
+                max-width: 100vw;
+                padding: 0 0px;
+            }
+        }
+        @media (max-width: 600px) {
+            #main-container {
+                max-width: 100vw;
+                padding: 0 0px;
+            }
+            #attendanceTable th, #attendanceTable td {
+                padding: 10px 4px;
+                font-size: 0.97em;
+            }
+            #attendanceTable {
+                font-size: 0.97em;
+            }
+            #controls {
+                gap: 6px;
+            }
+            #exclusionList {
+                font-size: 0.97em;
+            }
+            .att-col, .excl-col {
+                display: none;
+            }
+            #runningTotal {
+                font-size: 1.5em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>PSFA Swim Club Register</h1>
+    <div id="main-container">
+        <div id="controls">
+            <div id="dateRow">
+                <label for="datePicker">Date:</label>
+                <input type="date" id="datePicker" value="{{ selected_date }}">
+            </div>
+            <div id="searchRow">
+                <input type="text" id="searchBox" placeholder="Search for names...">
+                <button type="button" id="cancelBtn">Cancel</button>
+            </div>
+            <div id="supRow">
+                <span id="supLabel">Supervisors</span>
+                <span class="supervisor-toggle">
+                    <label><input type="radio" name="supervisors" id="supervisors2" {% if supervisors == 2 %}checked{% endif %}>2</label>
+                </span>
+                <span class="supervisor-toggle">
+                    <label><input type="radio" name="supervisors" id="supervisors3" {% if supervisors == 3 %}checked{% endif %}>3</label>
+                </span>
+            </div>
+            <div id="tallyRow">
+                <span id="runningTotal">
+                    <span id="currentCount">0</span> / <span id="maxLabel">{{ max_attendees }}</span>
+                </span>
+            </div>
+        </div>
+        <div id="exclusionList" style="display:none"></div>
+        <table id="attendanceTable">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th class="att-col">Att.</th>
+                    <th class="excl-col">Wait</th>
+                    <th>Present</th>
+                    <th>Waited</th>
+                    <th>In Pool</th>
+                </tr>
+            </thead>
+            <tbody id="attendanceTbody">
+                <!-- Rows will be rendered by JS -->
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+
