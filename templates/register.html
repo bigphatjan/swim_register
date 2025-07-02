@@ -63,6 +63,7 @@
         var input = document.getElementById("searchBox");
         input.value = "";
         filterNames();
+	input.focus();
     }
 
     async function updateAttendance(name, present, excluded, admitted) {
@@ -128,7 +129,7 @@
             if (count === 0) {
                 ratio = 1.0;
             } else {
-                ratio = exclCount / count;
+                ratio = (exclCount+1) / (count+1);
             }
             allStudents.push({
                 name: name,
@@ -452,7 +453,7 @@
 
                 var label = document.createElement("label");
                 label.htmlFor = "excluded_" + att.name + "_suggestion";
-                label.textContent = " " + att.name + " (" + att.attendanceCount + " att, " + att.exclusionCount + " wait, ratio: " + att.ratio.toFixed(2) + ")";
+                label.textContent = " " + att.name + " (" + att.attendanceCount + " att, " + att.exclusionCount + " wait, score: " + att.ratio.toFixed(2) + ")";
                 if (!attendance[att.name].present) {
                     label.style.color = "#888";
                     label.textContent += " [not present today]";
@@ -693,9 +694,9 @@
             <thead>
                 <tr>
                     <th>Name</th>
-                    <th class="att-col">Att.</th>
-                    <th class="excl-col">Wait</th>
-                    <th>Present</th>
+                    <th class="att-col">&Sigma Att.</th>
+                    <th class="excl-col">&Sigma Wait</th>
+                    <th>Attended</th>
                     <th>Waited</th>
                     <th>In Pool</th>
                 </tr>
